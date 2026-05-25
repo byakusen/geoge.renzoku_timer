@@ -589,26 +589,37 @@
             progressBar.style.strokeDashoffset = offset;
         }
 
+        // ページ読み込み時刻を記録（起動直後の意図しないピンポン音を防ぐため）
+        const pageLoadTime = Date.now();
+
         function playSound(sound, volume = 1.0) {
             if (!sound || isMuted) return;
+            // ページ読み込みから500ms以内のchimeSound（ピンポン）再生はブロック
+            if (sound === chimeSound && Date.now() - pageLoadTime < 500) return;
             sound.volume = volume;
             sound.currentTime = 0;
             sound.play().catch(() => {});
         }
 
         function unlockAudio() {
-            // 音声ロック解除のため一瞬だけ再生するが、音量0にして無音化
-            allSounds.forEach(sound => {
-                const originalVolume = sound.volume;
+            // ピッピッ系の音だけロック解除（ピンポン音 chimeSound は触らない）
+            // chimeSound は触ると一瞬「ピン」が漏れる場合があるので、
+            // 開始ボタンでは load() で初期化だけ行う
+            [uiClick, tickBeep].forEach(sound => {
                 sound.volume = 0;
-                sound.play().then(() => { 
-                    sound.pause(); 
-                    sound.currentTime = 0; 
-                    sound.volume = originalVolume;
-                }).catch(() => {
-                    sound.volume = originalVolume;
-                });
+                const playPromise = sound.play();
+                if (playPromise !== undefined) {
+                    playPromise.then(() => {
+                        sound.pause();
+                        sound.currentTime = 0;
+                        sound.volume = 1;
+                    }).catch(() => {
+                        sound.volume = 1;
+                    });
+                }
             });
+            // chimeSound は再生せずに load だけ
+            try { chimeSound.load(); } catch(e) {}
         }
 
         function showMessage(msg) {
