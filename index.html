@@ -592,19 +592,93 @@
         // ページ読み込み時刻を記録（起動直後の意図しないピンポン音を防ぐため）
         const pageLoadTime = Date.now();
 
-        function playSound(sound, volume = 1.0) {
-            if (!sound || isMuted) return;
-            // ページ読み込みから500ms以内のchimeSound（ピンポン）再生はブロック
-            if (sound === chimeSound && Date.now() - pageLoadTime < 500) return;
+        // ===== Web Audio API による安定再生 =====
+        // 開始時に音声データをメモリへ丸ごと読み込み、以降はネットワークに
+        // 依存せず再生する。これにより「時間が来てもピンポンが鳴らない」
+        // （回線の一瞬の詰まりや音声データの破棄による再生失敗）を防ぐ。
+        const SOUND_URLS = {
+            chime: 'https://github.com/byakusen/ggeogelge.timeron/raw/refs/heads/main/pinpon.mp3',
+            beep:  'https://github.com/byakusen/ggeogelge.timeron/raw/refs/heads/main/timer_oto.mp3'
+        };
+        let audioCtx = null;
+        const audioBuffers = {};   // key: 'chime' | 'beep' → AudioBuffer
+        let buffersLoading = false;
+
+        function ensureAudioContext() {
+            if (!audioCtx) {
+                const AC = window.AudioContext || window.webkitAudioContext;
+                if (AC) {
+                    try { audioCtx = new AC(); } catch (e) { audioCtx = null; }
+                }
+            }
+            // ユーザー操作のタイミングで必ず resume（自動再生制限の解除）
+            if (audioCtx && audioCtx.state === 'suspended') {
+                audioCtx.resume().catch(() => {});
+            }
+        }
+
+        async function loadAudioBuffers() {
+            if (!audioCtx || buffersLoading) return;
+            buffersLoading = true;
+            for (const key of Object.keys(SOUND_URLS)) {
+                if (audioBuffers[key]) continue;
+                try {
+                    const res = await fetch(SOUND_URLS[key]);
+                    const arr = await res.arrayBuffer();
+                    audioBuffers[key] = await audioCtx.decodeAudioData(arr);
+                } catch (e) {
+                    // 読み込み失敗時はこの音だけ <audio> フォールバックを使う
+                    console.warn('音声バッファ読込失敗:', key, e);
+                }
+            }
+            buffersLoading = false;
+        }
+
+        // フォールバック用：キー → <audio> 要素の対応
+        const fallbackElements = {
+            chime: chimeSound,
+            beep:  tickBeep,
+            click: uiClick
+        };
+
+        function playSound(key, volume = 1.0) {
+            if (isMuted) return;
+            // ページ読み込みから500ms以内のピンポン再生はブロック（起動直後の暴発防止）
+            if (key === 'chime' && Date.now() - pageLoadTime < 500) return;
+
+            // 第一候補：メモリ上のバッファから再生（ネットワーク不要・確実）
+            ensureAudioContext();
+            const bufferKey = key === 'click' ? 'beep' : key; // クリック音はピッピッと同じ音源
+            if (audioCtx && audioCtx.state === 'running' && audioBuffers[bufferKey]) {
+                try {
+                    const src = audioCtx.createBufferSource();
+                    src.buffer = audioBuffers[bufferKey];
+                    const gain = audioCtx.createGain();
+                    gain.gain.value = volume;
+                    src.connect(gain);
+                    gain.connect(audioCtx.destination);
+                    src.start(0);
+                    return;
+                } catch (e) {
+                    // 失敗したら下のフォールバックへ
+                }
+            }
+
+            // 第二候補：従来の <audio> 要素（バッファ未読込時の保険）
+            const sound = fallbackElements[key];
+            if (!sound) return;
             sound.volume = volume;
             sound.currentTime = 0;
             sound.play().catch(() => {});
         }
 
         function unlockAudio() {
-            // ピッピッ系の音だけロック解除（ピンポン音 chimeSound は触らない）
-            // chimeSound は触ると一瞬「ピン」が漏れる場合があるので、
-            // 開始ボタンでは load() で初期化だけ行う
+            // Web Audio を起動し、音声データをメモリへ先読み
+            ensureAudioContext();
+            loadAudioBuffers();
+
+            // 保険：フォールバック用の <audio> もロック解除しておく
+            // （ピンポン音 chimeSound は触ると「ピン」が漏れることがあるため load のみ）
             [uiClick, tickBeep].forEach(sound => {
                 sound.volume = 0;
                 const playPromise = sound.play();
@@ -618,7 +692,6 @@
                     });
                 }
             });
-            // chimeSound は再生せずに load だけ
             try { chimeSound.load(); } catch(e) {}
         }
 
@@ -697,7 +770,7 @@
             timeLeft = parseInt(intervalInput.value);
             statusLabel.textContent = "MEASURING";
             timerWrapper.classList.remove('is-prepping');
-            playSound(chimeSound);
+            playSound('chime');
             updateDisplay();
         }
 
@@ -707,10 +780,10 @@
 
             // 準備期間中は毎秒ピッピッ、本番中は残り3秒以下でピッピッ
             if (mode === 'PREP' && timeLeft > 0) {
-                playSound(tickBeep, 0.8);
+                playSound('beep', 0.8);
             }
             if (mode === 'RUNNING' && timeLeft <= 3 && timeLeft > 0) {
-                playSound(tickBeep, 0.8);
+                playSound('beep', 0.8);
             }
 
             // 0を表示してから次のサイクルへ移行する
@@ -722,7 +795,7 @@
                     } else {
                         signalCount++;
                         timeLeft = parseInt(intervalInput.value);
-                        playSound(chimeSound);
+                        playSound('chime');
                         confetti({ particleCount: 40, spread: 50, origin: { y: 0.8 }, colors: ['#ffffff', '#00d2ff', '#f1c40f'] });
                         updateDisplay();
                     }
@@ -745,7 +818,7 @@
 
         function resetTimer() {
             stopTimer();
-            playSound(uiClick);
+            playSound('click');
             mode = 'IDLE';
             totalSeconds = 0;
             signalCount = 0;
@@ -799,6 +872,10 @@
         
         timeLeft = parseInt(intervalInput.value);
         updateDisplay();
+
+        // ページを開いた時点で音声データの先読みを開始（再生はしない）
+        ensureAudioContext();
+        loadAudioBuffers();
     </script>
 </body>
 </html>
